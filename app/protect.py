@@ -17,6 +17,7 @@ from typing import BinaryIO
 
 import pikepdf
 import pypdfium2 as pdfium
+from lxml import etree
 from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "Encreept"
@@ -25,6 +26,13 @@ MAX_PAGES = int(os.environ.get("ENCREEPT_MAX_PAGES", "400"))
 CONVERT_TIMEOUT_SECONDS = int(os.environ.get("ENCREEPT_CONVERT_TIMEOUT", "900"))
 # Caps the memory one page can use, however large its physical size is.
 MAX_PAGE_SIDE_PX = 3000
+# LibreOffice loads one piece at a time, which keeps long decks within 512 MB of memory.
+SLIDES_PER_CONVERSION = 20
+
+_PML_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
+_DML_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_REL_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+_XML_PARSER = etree.XMLParser(resolve_entities=False, no_network=True)
 
 QUALITY_PRESETS = {
     "standard": {"dpi": 150, "jpeg_quality": 80},
@@ -125,6 +133,99 @@ def _convert_to_pdf(source: Path, workdir: Path) -> Path:
         raise ProtectionError(
             "This document couldn't be converted. It may be damaged or password-protected."
         )
+    return converted
+
+
+def _slide_part_name(target: str) -> str:
+    return target.lstrip("/") if target.startswith("/") else f"ppt/{target}"
+
+
+def _slide_is_hidden(package: zipfile.ZipFile, target: str | None) -> bool:
+    if target is None:
+        return False
+    try:
+        return etree.fromstring(package.read(_slide_part_name(target)), _XML_PARSER).get("show") == "0"
+    except (KeyError, etree.XMLSyntaxError):
+        return False
+
+
+def _fix_slide_number(slide_xml: bytes, number: int) -> bytes:
+    """Replace slide number fields with fixed text, as a piece would otherwise restart from 1."""
+    slide = etree.fromstring(slide_xml, _XML_PARSER)
+    fields = slide.xpath("//a:fld[@type='slidenum']", namespaces={"a": _DML_NS})
+    if not fields:
+        return slide_xml
+    for field in fields:
+        field.tag = f"{{{_DML_NS}}}r"
+        field.attrib.clear()
+        for child in list(field):
+            if child.tag == f"{{{_DML_NS}}}pPr":
+                field.remove(child)
+            elif child.tag == f"{{{_DML_NS}}}t":
+                child.text = str(number)
+    return etree.tostring(slide, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
+def _split_deck(source: Path, workdir: Path) -> list[Path]:
+    """Split a long deck into smaller decks, in slide order. Short decks come back unchanged.
+
+    LibreOffice's memory grows with the slides in the file it loads, whatever it exports.
+    Each piece keeps every package file and only lists its own slides in presentation.xml,
+    so links between slides still resolve and LibreOffice doesn't load the rest.
+    """
+    try:
+        with zipfile.ZipFile(source) as package:
+            presentation = etree.fromstring(package.read("ppt/presentation.xml"), _XML_PARSER)
+            slide_list = presentation.find(f"{{{_PML_NS}}}sldIdLst")
+            slide_ids = [] if slide_list is None else list(slide_list)
+            if len(slide_ids) <= SLIDES_PER_CONVERSION:
+                return [source]
+
+            relationships = etree.fromstring(package.read("ppt/_rels/presentation.xml.rels"), _XML_PARSER)
+            targets = {rel.get("Id"): rel.get("Target") for rel in relationships}
+            first_number = int(presentation.get("firstSlideNum", "1"))
+
+            # Custom shows and section lists can name slides that a piece no longer lists.
+            for tag in ("custShowLst", "extLst"):
+                element = presentation.find(f"{{{_PML_NS}}}{tag}")
+                if element is not None:
+                    presentation.remove(element)
+
+            pieces = []
+            for start in range(0, len(slide_ids), SLIDES_PER_CONVERSION):
+                chunk = slide_ids[start : start + SLIDES_PER_CONVERSION]
+                # LibreOffice skips hidden slides, and a piece with nothing to export makes no PDF.
+                if all(_slide_is_hidden(package, targets.get(s.get(_REL_ID))) for s in chunk):
+                    continue
+
+                slide_list[:] = chunk
+                changed = {
+                    "ppt/presentation.xml": etree.tostring(
+                        presentation, xml_declaration=True, encoding="UTF-8", standalone=True
+                    )
+                }
+                for offset, slide_id in enumerate(chunk):
+                    name = _slide_part_name(targets[slide_id.get(_REL_ID)])
+                    changed[name] = _fix_slide_number(package.read(name), first_number + start + offset)
+
+                piece = workdir / f"piece-{start}.pptx"
+                with zipfile.ZipFile(piece, "w", zipfile.ZIP_STORED) as output:
+                    for info in package.infolist():
+                        output.writestr(info.filename, changed.get(info.filename) or package.read(info))
+                pieces.append(piece)
+            return pieces or [source]
+    except (KeyError, ValueError, etree.XMLSyntaxError, zipfile.BadZipFile):
+        # An unusual package: let LibreOffice try the whole file.
+        return [source]
+
+
+def _convert_document(source: Path, extension: str, workdir: Path) -> list[Path]:
+    pieces = _split_deck(source, workdir) if extension == ".pptx" else [source]
+    converted = []
+    for piece in pieces:
+        converted.append(_convert_to_pdf(piece, workdir))
+        if piece != source:
+            piece.unlink()
     return converted
 
 
@@ -238,43 +339,51 @@ class _ImagePdfWriter:
         )
 
 
-def _rasterise_to_pdf(source_pdf: Path, preset: dict, destination: Path) -> None:
+def _open_pdf(path: Path) -> pdfium.PdfDocument:
     try:
-        document = pdfium.PdfDocument(source_pdf)
+        return pdfium.PdfDocument(path)
     except pdfium.PdfiumError:
         raise ProtectionError(
             "This PDF couldn't be opened. It may be damaged or password-protected."
         ) from None
 
-    try:
-        page_count = len(document)
-        if page_count == 0:
-            raise ProtectionError("This document has no pages.")
-        if page_count > MAX_PAGES:
-            raise ProtectionError(
-                f"This document has {page_count} pages. The limit is {MAX_PAGES}."
-            )
 
-        with destination.open("wb") as handle:
-            writer = _ImagePdfWriter(handle)
-            for index in range(page_count):
-                page = document[index]
-                try:
-                    size_pt = page.get_size()
-                    scale = min(preset["dpi"] / 72, MAX_PAGE_SIDE_PX / max(size_pt))
-                    bitmap = page.render(scale=scale, may_draw_forms=True)
-                    image = _apply_watermark(bitmap.to_pil())
-                    bitmap.close()
-                finally:
-                    page.close()
-
-                buffer = io.BytesIO()
-                image.save(buffer, format="JPEG", quality=preset["jpeg_quality"], optimize=True)
-                writer.add_page(buffer.getvalue(), image.size, size_pt)
-                image.close()
-            writer.finish()
-    finally:
+def _rasterise_to_pdf(sources: list[Path], preset: dict, destination: Path) -> None:
+    page_count = 0
+    for source in sources:
+        document = _open_pdf(source)
+        page_count += len(document)
         document.close()
+    if page_count == 0:
+        raise ProtectionError("This document has no pages.")
+    if page_count > MAX_PAGES:
+        raise ProtectionError(
+            f"This document has {page_count} pages. The limit is {MAX_PAGES}."
+        )
+
+    with destination.open("wb") as handle:
+        writer = _ImagePdfWriter(handle)
+        for source in sources:
+            document = _open_pdf(source)
+            try:
+                for index in range(len(document)):
+                    page = document[index]
+                    try:
+                        size_pt = page.get_size()
+                        scale = min(preset["dpi"] / 72, MAX_PAGE_SIDE_PX / max(size_pt))
+                        bitmap = page.render(scale=scale, may_draw_forms=True)
+                        image = _apply_watermark(bitmap.to_pil())
+                        bitmap.close()
+                    finally:
+                        page.close()
+
+                    buffer = io.BytesIO()
+                    image.save(buffer, format="JPEG", quality=preset["jpeg_quality"], optimize=True)
+                    writer.add_page(buffer.getvalue(), image.size, size_pt)
+                    image.close()
+            finally:
+                document.close()
+        writer.finish()
 
 
 def _save_locked(plain_pdf: Path, owner_password: str, destination: Path) -> None:
@@ -317,9 +426,9 @@ def protect_document(upload: BinaryIO, filename: str, quality: str, owner_passwo
         shutil.copyfileobj(upload, handle)
 
     _validate_file(source, extension)
-    pdf_path = source if extension == ".pdf" else _convert_to_pdf(source, workdir)
+    pdf_paths = [source] if extension == ".pdf" else _convert_document(source, extension, workdir)
     plain_pdf = workdir / "pages.pdf"
-    _rasterise_to_pdf(pdf_path, preset, plain_pdf)
+    _rasterise_to_pdf(pdf_paths, preset, plain_pdf)
     destination = workdir / "output.pdf"
     _save_locked(plain_pdf, owner_password, destination)
     return destination

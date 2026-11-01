@@ -63,7 +63,7 @@ async function errorMessage(response) {
   try {
     return (await response.json()).detail;
   } catch {
-    return "The server couldn't protect this document. Try again in a minute.";
+    return "The server stopped while working on this document, which usually means it's too large or complex. Save it as a PDF, upload that instead, and wait a minute before trying.";
   }
 }
 

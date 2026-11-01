@@ -6,11 +6,16 @@ import zipfile
 import pikepdf
 import pypdfium2 as pdfium
 import pytest
+from docx import Document
 from fastapi.testclient import TestClient
+from lxml import etree
+from pptx import Presentation
 
 from app import main, protect
 
 SECRET_TEXT = "Confidential paragraph"
+
+needs_libreoffice = pytest.mark.skipif(protect._soffice_command() is None, reason="LibreOffice isn't installed")
 
 
 def make_pdf(pages: int = 2, size=(612, 792), rotate: int = 0) -> bytes:
@@ -225,6 +230,88 @@ def test_office_files_go_through_the_converter(client, fake_soffice, name, folde
     assert len(pdfium.PdfDocument(response.content)) == 3
     assert extract_text(response.content).strip() == ""
     assert "ENCREEPT_OWNER_PASSWORD" not in fake_soffice.read_text().split("\n")
+
+
+def make_deck(slides: int, hidden: range = range(0)) -> bytes:
+    deck = Presentation()
+    for number in range(slides):
+        slide = deck.slides.add_slide(deck.slide_layouts[1])
+        slide.shapes.title.text = f"Slide {number + 1}"
+        if number in hidden:
+            slide._element.set("show", "0")
+    buffer = io.BytesIO()
+    deck.save(buffer)
+    return buffer.getvalue()
+
+
+def test_long_deck_is_split_in_slide_order(tmp_path, monkeypatch):
+    monkeypatch.setattr(protect, "SLIDES_PER_CONVERSION", 4)
+    source = tmp_path / "deck.pptx"
+    source.write_bytes(make_deck(10))
+
+    pieces = protect._split_deck(source, tmp_path)
+
+    titles = [[s.shapes.title.text for s in Presentation(p).slides] for p in pieces]
+    assert titles == [[f"Slide {n}" for n in group] for group in ([1, 2, 3, 4], [5, 6, 7, 8], [9, 10])]
+
+
+@needs_libreoffice
+def test_slide_numbers_continue_across_pieces(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(protect, "SLIDES_PER_CONVERSION", 2)
+    deck = Presentation()
+    for _ in range(5):
+        slide = deck.slides.add_slide(deck.slide_layouts[1])
+        paragraph = slide.shapes.title.text_frame.paragraphs[0]._p
+        paragraph.append(
+            etree.fromstring(
+                f'<a:fld xmlns:a="{protect._DML_NS}" id="{{B6F15528-21DE-4FAA-801E-634DDDAF4B2B}}" type="slidenum">'
+                '<a:rPr lang="en-US"/><a:t>0</a:t></a:fld>'
+            )
+        )
+    source = tmp_path / "numbered.pptx"
+    deck.save(source)
+
+    (tmp_path / "job").mkdir()
+    pieces = protect._split_deck(source, tmp_path / "job")
+    pdfs = [protect._convert_to_pdf(piece, tmp_path / "job") for piece in pieces]
+
+    pages = []
+    for path in pdfs:
+        document = pdfium.PdfDocument(path)
+        pages += [document[i].get_textpage().get_text_range().strip() for i in range(len(document))]
+        document.close()
+    assert pages == ["1", "2", "3", "4", "5"]
+
+
+def test_short_or_unusual_decks_are_not_split(tmp_path):
+    source = tmp_path / "deck.pptx"
+    source.write_bytes(make_deck(protect.SLIDES_PER_CONVERSION))
+    assert protect._split_deck(source, tmp_path) == [source]
+
+    unusual = tmp_path / "unusual.pptx"
+    unusual.write_bytes(make_office("ppt/"))
+    assert protect._split_deck(unusual, tmp_path) == [unusual]
+
+
+@needs_libreoffice
+def test_real_conversion_of_long_deck_with_hidden_slides(client, monkeypatch):
+    monkeypatch.setattr(protect, "SLIDES_PER_CONVERSION", 3)
+    # Slides 4-6 are a whole hidden piece; slide 8 is hidden inside a piece.
+    response = upload(client, make_deck(9, hidden=[3, 4, 5, 7]), "deck.pptx")
+    assert response.status_code == 200
+    assert len(pdfium.PdfDocument(response.content)) == 5
+    assert extract_text(response.content).strip() == ""
+
+
+@needs_libreoffice
+def test_real_conversion_of_word_document(client):
+    document = Document()
+    document.add_paragraph(SECRET_TEXT)
+    buffer = io.BytesIO()
+    document.save(buffer)
+    response = upload(client, buffer.getvalue(), "paper.docx")
+    assert response.status_code == 200
+    assert extract_text(response.content).strip() == ""
 
 
 def test_converter_producing_nothing_is_an_error(client, tmp_path, monkeypatch):
