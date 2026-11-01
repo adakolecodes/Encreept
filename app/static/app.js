@@ -1,4 +1,4 @@
-const MAX_BYTES = 25 * 1024 * 1024;
+const MAX_BYTES = 60 * 1024 * 1024;
 const EXTENSIONS = [".pdf", ".doc", ".docx", ".ppt", ".pptx"];
 
 const sheet = document.querySelector(".sheet");
@@ -45,7 +45,7 @@ function chooseFile(file) {
   }
   if (file.size > MAX_BYTES) {
     submit.disabled = true;
-    return setStatus("This file is over the 25 MB limit.", true);
+    return setStatus("This file is over the 60 MB limit.", true);
   }
   title.textContent = file.name;
   document.getElementById("drop-hint").textContent = "Choose or drop another file to replace it.";
@@ -73,7 +73,7 @@ form.addEventListener("submit", async (event) => {
 
   submit.disabled = true;
   sheet.dataset.state = "working";
-  setStatus("Protecting your document. Long files and first use after a quiet spell can take a few minutes.");
+  setStatus("Protecting your document. Keep this page open: long files can take several minutes or more.");
 
   try {
     const response = await fetch("/api/protect", { method: "POST", body: new FormData(form) });

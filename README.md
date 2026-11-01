@@ -1,6 +1,6 @@
 # Encreept
 
-A small FastAPI app that turns a PDF, Word or PowerPoint file into a PDF that can be read but not copied. Nothing is stored: working files are deleted before the download starts.
+A small FastAPI app that turns a PDF, Word or PowerPoint file into a PDF that can be read but not copied. Nothing is kept: working files are deleted as soon as the download has been sent.
 
 ## How it works
 
@@ -41,6 +41,6 @@ The free plan has 512 MB of memory and a fraction of a CPU, and it sleeps after 
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
 | `ENCREEPT_OWNER_PASSWORD` | Random for each run | Master password for the output PDFs |
-| `ENCREEPT_MAX_UPLOAD_MB` | `25` | Upload limit. The page's limit in `app/static/app.js` and its hint text need to match. |
-| `ENCREEPT_MAX_PAGES` | `100` | Page limit |
-| `ENCREEPT_CONVERT_TIMEOUT` | `240` | Seconds allowed for an Office conversion |
+| `ENCREEPT_MAX_UPLOAD_MB` | `60` | Upload limit. The page's limit in `app/static/app.js` and its hint text need to match. |
+| `ENCREEPT_MAX_PAGES` | `400` | Page limit. The page's hint text needs to match. |
+| `ENCREEPT_CONVERT_TIMEOUT` | `900` | Seconds allowed for an Office conversion |

@@ -151,6 +151,24 @@ def test_page_limit(client, monkeypatch):
     assert "limit is 1" in response.json()["detail"]
 
 
+def test_multi_page_document_keeps_page_order_and_sizes(client):
+    sizes = [(300, 400), (500, 200), (612, 792), (200, 200), (400, 300)]
+    source = pikepdf.new()
+    for size in sizes:
+        source.add_blank_page(page_size=size)
+    buffer = io.BytesIO()
+    source.save(buffer)
+
+    response = upload(client, buffer.getvalue())
+
+    assert response.status_code == 200
+    document = pdfium.PdfDocument(response.content)
+    assert [document[i].get_size() for i in range(len(document))] == sizes
+    with pikepdf.open(io.BytesIO(response.content)) as pdf:
+        assert pdf.is_encrypted and not pdf.allow.extract
+        assert pdf.check_pdf_syntax() == []
+
+
 def test_size_limit(client, monkeypatch):
     monkeypatch.setattr(main, "MAX_REQUEST_BYTES", 10)
     assert upload(client, make_pdf()).status_code == 413
@@ -163,7 +181,7 @@ def test_unicode_filename_download_header(client):
 
 
 def test_no_working_files_left_behind(client, tmp_path, monkeypatch):
-    monkeypatch.setattr(protect.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(main.tempfile, "tempdir", str(tmp_path))
     assert upload(client, make_pdf(pages=1)).status_code == 200
     assert upload(client, b"bad", "bad.pdf").status_code == 400
     assert list(tmp_path.iterdir()) == []

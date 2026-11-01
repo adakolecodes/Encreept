@@ -2,19 +2,21 @@ import asyncio
 import logging
 import os
 import secrets
+import shutil
+import tempfile
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.protect import ConverterError, ProtectionError, protect_document
 
 logger = logging.getLogger("encreept")
 
-MAX_UPLOAD_MB = int(os.environ.get("ENCREEPT_MAX_UPLOAD_MB", "25"))
+MAX_UPLOAD_MB = int(os.environ.get("ENCREEPT_MAX_UPLOAD_MB", "60"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 # Room for the multipart boundaries and form fields around the file.
 MAX_REQUEST_BYTES = MAX_UPLOAD_BYTES + 64 * 1024
@@ -54,33 +56,42 @@ def healthz() -> dict:
 
 
 @app.post("/api/protect")
-async def protect(file: UploadFile = File(...), quality: str = Form("standard")) -> Response:
+async def protect(
+    background_tasks: BackgroundTasks, file: UploadFile = File(...), quality: str = Form("standard")
+) -> Response:
     filename = file.filename or ""
     if file.size == 0:
         raise HTTPException(status_code=400, detail="This file is empty.")
     if file.size is not None and file.size > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail=f"The file limit is {MAX_UPLOAD_MB} MB.")
 
-    async with processing_slot:
-        try:
-            result = await run_in_threadpool(
-                protect_document, file.file, filename, quality, OWNER_PASSWORD
-            )
-        except ProtectionError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from None
-        except ConverterError as error:
-            raise HTTPException(status_code=503, detail=str(error)) from None
-        except Exception:
-            # The traceback goes to the logs, but never the document's name or contents.
-            logger.exception("Protecting a document failed")
-            raise HTTPException(
-                status_code=500, detail="This document couldn't be protected. Try a different file."
-            ) from None
+    # Removed once the download has been sent, or straight away if anything fails.
+    workdir = tempfile.mkdtemp(prefix="encreept-")
+    try:
+        async with processing_slot:
+            try:
+                result = await run_in_threadpool(
+                    protect_document, file.file, filename, quality, OWNER_PASSWORD, Path(workdir)
+                )
+            except ProtectionError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from None
+            except ConverterError as error:
+                raise HTTPException(status_code=503, detail=str(error)) from None
+            except Exception:
+                # The traceback goes to the logs, but never the document's name or contents.
+                logger.exception("Protecting a document failed")
+                raise HTTPException(
+                    status_code=500, detail="This document couldn't be protected. Try a different file."
+                ) from None
+    except BaseException:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
 
+    background_tasks.add_task(shutil.rmtree, workdir, ignore_errors=True)
     name = _download_name(filename)
     ascii_name = name.encode("ascii", "ignore").decode().replace('"', "") or "document-encreept.pdf"
-    return Response(
-        content=result,
+    return FileResponse(
+        result,
         media_type="application/pdf",
         headers={
             "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name)}",

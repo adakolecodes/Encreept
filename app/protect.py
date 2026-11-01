@@ -10,7 +10,6 @@ import os
 import shutil
 import signal
 import subprocess
-import tempfile
 import zipfile
 from functools import lru_cache
 from pathlib import Path
@@ -22,8 +21,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 APP_NAME = "Encreept"
 
-MAX_PAGES = int(os.environ.get("ENCREEPT_MAX_PAGES", "100"))
-CONVERT_TIMEOUT_SECONDS = int(os.environ.get("ENCREEPT_CONVERT_TIMEOUT", "240"))
+MAX_PAGES = int(os.environ.get("ENCREEPT_MAX_PAGES", "400"))
+CONVERT_TIMEOUT_SECONDS = int(os.environ.get("ENCREEPT_CONVERT_TIMEOUT", "900"))
 # Caps the memory one page can use, however large its physical size is.
 MAX_PAGE_SIDE_PX = 3000
 
@@ -185,25 +184,61 @@ def _apply_watermark(page: Image.Image) -> Image.Image:
     return Image.alpha_composite(page.convert("RGBA"), overlay).convert("RGB")
 
 
-def _add_image_page(pdf: pikepdf.Pdf, jpeg: bytes, size_px: tuple[int, int], size_pt: tuple[float, float]) -> None:
-    width_pt, height_pt = size_pt
-    page = pdf.add_blank_page(page_size=size_pt)
-    image = pikepdf.Stream(
-        pdf,
-        jpeg,
-        Type=pikepdf.Name.XObject,
-        Subtype=pikepdf.Name.Image,
-        Width=size_px[0],
-        Height=size_px[1],
-        ColorSpace=pikepdf.Name.DeviceRGB,
-        BitsPerComponent=8,
-        Filter=pikepdf.Name.DCTDecode,
-    )
-    page.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im0=image))
-    page.Contents = pdf.make_stream(f"q {width_pt:.2f} 0 0 {height_pt:.2f} 0 0 cm /Im0 Do Q".encode())
+class _ImagePdfWriter:
+    """Writes image-only pages straight to disk, so long documents don't build up in memory.
+
+    Building the file with pikepdf holds every page image in memory until it saves.
+    """
+
+    def __init__(self, handle: BinaryIO) -> None:
+        self._handle = handle
+        self._offsets: dict[int, int] = {}
+        self._page_numbers: list[int] = []
+        # Objects 1 and 2 (catalog and page tree) are written last, once the pages are known.
+        self._next_number = 3
+        handle.write(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+
+    def _write_object(self, number: int, body: bytes) -> None:
+        self._offsets[number] = self._handle.tell()
+        self._handle.write(b"%d 0 obj\n%s\nendobj\n" % (number, body))
+
+    def _write_stream(self, number: int, dictionary: bytes, data: bytes) -> None:
+        self._write_object(number, b"<< %s /Length %d >>\nstream\n%s\nendstream" % (dictionary, len(data), data))
+
+    def add_page(self, jpeg: bytes, size_px: tuple[int, int], size_pt: tuple[float, float]) -> None:
+        page, contents, image = self._next_number, self._next_number + 1, self._next_number + 2
+        self._next_number += 3
+        width_pt, height_pt = size_pt
+
+        self._write_object(
+            page,
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width_pt:.2f} {height_pt:.2f}] "
+            f"/Resources << /XObject << /Im0 {image} 0 R >> >> /Contents {contents} 0 R >>".encode(),
+        )
+        self._write_stream(contents, b"", f"q {width_pt:.2f} 0 0 {height_pt:.2f} 0 0 cm /Im0 Do Q".encode())
+        self._write_stream(
+            image,
+            f"/Type /XObject /Subtype /Image /Width {size_px[0]} /Height {size_px[1]} "
+            "/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode".encode(),
+            jpeg,
+        )
+        self._page_numbers.append(page)
+
+    def finish(self) -> None:
+        kids = " ".join(f"{number} 0 R" for number in self._page_numbers)
+        self._write_object(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+        self._write_object(2, f"<< /Type /Pages /Kids [{kids}] /Count {len(self._page_numbers)} >>".encode())
+
+        xref_offset = self._handle.tell()
+        self._handle.write(b"xref\n0 %d\n0000000000 65535 f \n" % self._next_number)
+        for number in range(1, self._next_number):
+            self._handle.write(b"%010d 00000 n \n" % self._offsets[number])
+        self._handle.write(
+            b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (self._next_number, xref_offset)
+        )
 
 
-def _rasterise_to_pdf(source_pdf: Path, preset: dict) -> pikepdf.Pdf:
+def _rasterise_to_pdf(source_pdf: Path, preset: dict, destination: Path) -> None:
     try:
         document = pdfium.PdfDocument(source_pdf)
     except pdfium.PdfiumError:
@@ -211,7 +246,6 @@ def _rasterise_to_pdf(source_pdf: Path, preset: dict) -> pikepdf.Pdf:
             "This PDF couldn't be opened. It may be damaged or password-protected."
         ) from None
 
-    output = pikepdf.new()
     try:
         page_count = len(document)
         if page_count == 0:
@@ -221,31 +255,35 @@ def _rasterise_to_pdf(source_pdf: Path, preset: dict) -> pikepdf.Pdf:
                 f"This document has {page_count} pages. The limit is {MAX_PAGES}."
             )
 
-        for index in range(page_count):
-            page = document[index]
-            try:
-                size_pt = page.get_size()
-                scale = min(preset["dpi"] / 72, MAX_PAGE_SIDE_PX / max(size_pt))
-                bitmap = page.render(scale=scale, may_draw_forms=True)
-                image = _apply_watermark(bitmap.to_pil())
-                bitmap.close()
-            finally:
-                page.close()
+        with destination.open("wb") as handle:
+            writer = _ImagePdfWriter(handle)
+            for index in range(page_count):
+                page = document[index]
+                try:
+                    size_pt = page.get_size()
+                    scale = min(preset["dpi"] / 72, MAX_PAGE_SIDE_PX / max(size_pt))
+                    bitmap = page.render(scale=scale, may_draw_forms=True)
+                    image = _apply_watermark(bitmap.to_pil())
+                    bitmap.close()
+                finally:
+                    page.close()
 
-            buffer = io.BytesIO()
-            image.save(buffer, format="JPEG", quality=preset["jpeg_quality"], optimize=True)
-            _add_image_page(output, buffer.getvalue(), image.size, size_pt)
-            image.close()
-    except Exception:
-        output.close()
-        raise
+                buffer = io.BytesIO()
+                image.save(buffer, format="JPEG", quality=preset["jpeg_quality"], optimize=True)
+                writer.add_page(buffer.getvalue(), image.size, size_pt)
+                image.close()
+            writer.finish()
     finally:
         document.close()
-    return output
 
 
-def _save_locked(pdf: pikepdf.Pdf, owner_password: str) -> bytes:
+def _save_locked(plain_pdf: Path, owner_password: str, destination: Path) -> None:
     """Anyone can open and read the file; everything else needs the owner password."""
+    with pikepdf.open(plain_pdf, access_mode=pikepdf.AccessMode.stream) as pdf:
+        _write_locked(pdf, owner_password, destination)
+
+
+def _write_locked(pdf: pikepdf.Pdf, owner_password: str, destination: Path) -> None:
     with pdf.open_metadata(set_pikepdf_as_editor=False) as metadata:
         metadata["pdf:Producer"] = APP_NAME
     pdf.docinfo["/Producer"] = APP_NAME
@@ -261,13 +299,11 @@ def _save_locked(pdf: pikepdf.Pdf, owner_password: str) -> bytes:
         print_lowres=False,
         print_highres=False,
     )
-    buffer = io.BytesIO()
-    pdf.save(buffer, encryption=pikepdf.Encryption(owner=owner_password, user="", R=6, allow=permissions))
-    return buffer.getvalue()
+    pdf.save(destination, encryption=pikepdf.Encryption(owner=owner_password, user="", R=6, allow=permissions))
 
 
-def protect_document(upload: BinaryIO, filename: str, quality: str, owner_password: str) -> bytes:
-    """Run the pipeline. All working files are deleted before this returns."""
+def protect_document(upload: BinaryIO, filename: str, quality: str, owner_password: str, workdir: Path) -> Path:
+    """Run the pipeline and return the finished PDF. The caller owns and deletes workdir."""
     extension = Path(filename).suffix.lower()
     if extension not in SUPPORTED_EXTENSIONS:
         raise ProtectionError("Upload a PDF, Word (.doc, .docx) or PowerPoint (.ppt, .pptx) file.")
@@ -275,14 +311,15 @@ def protect_document(upload: BinaryIO, filename: str, quality: str, owner_passwo
     if preset is None:
         raise ProtectionError("Choose standard or high quality.")
 
-    with tempfile.TemporaryDirectory(prefix="encreept-", ignore_cleanup_errors=True) as tmp:
-        workdir = Path(tmp)
-        # A fixed name keeps the user's filename away from the file system and command line.
-        source = workdir / f"input{extension}"
-        with source.open("wb") as handle:
-            shutil.copyfileobj(upload, handle)
+    # A fixed name keeps the user's filename away from the file system and command line.
+    source = workdir / f"input{extension}"
+    with source.open("wb") as handle:
+        shutil.copyfileobj(upload, handle)
 
-        _validate_file(source, extension)
-        pdf_path = source if extension == ".pdf" else _convert_to_pdf(source, workdir)
-        with _rasterise_to_pdf(pdf_path, preset) as output:
-            return _save_locked(output, owner_password)
+    _validate_file(source, extension)
+    pdf_path = source if extension == ".pdf" else _convert_to_pdf(source, workdir)
+    plain_pdf = workdir / "pages.pdf"
+    _rasterise_to_pdf(pdf_path, preset, plain_pdf)
+    destination = workdir / "output.pdf"
+    _save_locked(plain_pdf, owner_password, destination)
+    return destination
