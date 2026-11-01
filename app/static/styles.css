@@ -1,0 +1,221 @@
+:root {
+  --paper: #dbe7e4;
+  --sheet: #f6faf8;
+  --ink: #14264f;
+  --ink-soft: #46557a;
+  --plum: #7a2e5d;
+  --line: #a9bdc0;
+  --error: #a3202f;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 400 1.0625rem/1.55 Figtree, system-ui, sans-serif;
+}
+
+.masthead {
+  display: flex;
+  align-items: center;
+  gap: .6rem;
+  max-width: 76rem;
+  margin: 0 auto;
+  padding: 1.5rem 1.5rem 0;
+}
+
+.wordmark {
+  font: 400 1.5rem/1 Gloock, Georgia, serif;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+  gap: clamp(2rem, 5vw, 5rem);
+  align-items: start;
+  max-width: 76rem;
+  margin: 0 auto;
+  padding: clamp(2rem, 5vw, 4rem) 1.5rem;
+}
+
+h1 {
+  margin: 0 0 1.25rem;
+  font: 400 clamp(2.75rem, 6vw, 5rem)/1.02 Gloock, Georgia, serif;
+  letter-spacing: -.01em;
+  text-wrap: balance;
+}
+
+.lede {
+  max-width: 34rem;
+  margin: 0 0 2.5rem;
+  font-size: 1.2rem;
+}
+
+h2 {
+  margin: 0 0 .75rem;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.steps {
+  max-width: 34rem;
+  margin: 0;
+  padding-left: 1.4rem;
+  color: var(--ink-soft);
+}
+
+.steps li + li { margin-top: .35rem; }
+.steps li::marker { color: var(--plum); font-weight: 600; }
+
+.sheet {
+  position: relative;
+  padding: 1.5rem;
+  overflow: hidden;
+  background: var(--sheet);
+  border: 1px solid var(--line);
+  box-shadow: 0 1.5rem 3rem -1.5rem rgb(20 38 79 / .35);
+}
+
+/* The guilloche rosette, the fine-line pattern printed on banknotes and cheques. */
+.seal {
+  display: block;
+  width: min(62%, 15rem);
+  margin: .5rem auto 1.5rem;
+  fill: none;
+  stroke: var(--plum);
+  stroke-width: .35;
+}
+
+.sheet[data-state="working"] .seal { animation: turn 14s linear infinite; }
+.sheet[data-state="done"] .seal { stroke: var(--ink); animation: stamp .45s cubic-bezier(.2, 1.4, .4, 1); }
+
+@keyframes turn { to { transform: rotate(360deg); } }
+@keyframes stamp { from { transform: scale(1.3); opacity: .3; } }
+
+.drop {
+  display: block;
+  padding: 1.25rem;
+  text-align: center;
+  cursor: pointer;
+  border: 1.5px dashed var(--ink-soft);
+  transition: background-color .15s;
+}
+
+.drop:hover, .drop.is-over { background: var(--paper); }
+.drop:focus-within { outline: 3px solid var(--plum); outline-offset: 2px; }
+
+.drop input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.drop strong {
+  display: block;
+  font-size: 1.15rem;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.drop span {
+  color: var(--ink-soft);
+  font-size: .95rem;
+}
+
+.quality {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: .5rem;
+  margin: 1.25rem 0;
+  padding: 0;
+  border: 0;
+}
+
+.quality legend {
+  margin-bottom: .4rem;
+  padding: 0;
+  font-weight: 600;
+}
+
+.quality label { cursor: pointer; }
+
+.quality input {
+  position: absolute;
+  opacity: 0;
+}
+
+.quality span {
+  display: block;
+  height: 100%;
+  padding: .55rem .75rem;
+  border: 1px solid var(--line);
+}
+
+.quality small {
+  display: block;
+  color: var(--ink-soft);
+  font-size: .85rem;
+}
+
+.quality input:checked + span {
+  border-color: var(--ink);
+  box-shadow: inset 0 0 0 1px var(--ink);
+}
+
+.quality input:focus-visible + span { outline: 3px solid var(--plum); outline-offset: 2px; }
+
+button {
+  width: 100%;
+  padding: .85rem 1rem;
+  color: var(--sheet);
+  background: var(--ink);
+  border: 0;
+  font: 600 1.05rem Figtree, system-ui, sans-serif;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) { background: var(--plum); }
+button:focus-visible { outline: 3px solid var(--plum); outline-offset: 2px; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+
+.status {
+  min-height: 3em;
+  margin: .75rem 0 0;
+  font-size: .95rem;
+}
+
+.status.is-error { color: var(--error); font-weight: 500; }
+
+.limits {
+  max-width: 76rem;
+  margin: 0 auto;
+  padding: 0 1.5rem 3rem;
+}
+
+.limits p {
+  max-width: 48rem;
+  margin: 0;
+  padding-top: 1.25rem;
+  color: var(--ink-soft);
+  font-size: .95rem;
+  border-top: 1px solid var(--line);
+}
+
+.limits strong { color: var(--ink); font-weight: 600; }
+
+@media (max-width: 52rem) {
+  .layout { grid-template-columns: minmax(0, 1fr); }
+  .sheet { order: -1; }
+  h1 { order: -2; }
+  .pitch { display: contents; }
+  .lede { order: -2; margin-bottom: 0; }
+  .pitch h2 { margin-bottom: -1.25rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sheet[data-state] .seal { animation: none; }
+  .drop { transition: none; }
+}
