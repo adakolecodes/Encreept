@@ -167,6 +167,45 @@ h2 {
 
 .quality input:focus-visible + span { outline: 3px solid var(--plum); outline-offset: 2px; }
 
+.watermark { margin: 0 0 1.25rem; }
+
+.watermark-toggle {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.watermark-toggle input {
+  width: 1.1rem;
+  height: 1.1rem;
+  margin: 0;
+  accent-color: var(--ink);
+}
+
+#watermark-fields { margin-top: .75rem; }
+#watermark-fields label { display: block; margin-bottom: .25rem; font-size: .95rem; }
+
+#watermark-label {
+  width: 100%;
+  padding: .55rem .75rem;
+  color: var(--ink);
+  background: var(--sheet);
+  border: 1px solid var(--ink-soft);
+  font: inherit;
+}
+
+#watermark-label:focus-visible,
+.watermark-toggle input:focus-visible { outline: 3px solid var(--plum); outline-offset: 2px; }
+
+#watermark-count {
+  display: block;
+  margin-top: .25rem;
+  color: var(--ink-soft);
+  font-size: .85rem;
+}
+
 button {
   width: 100%;
   padding: .85rem 1rem;

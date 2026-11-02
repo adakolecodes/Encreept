@@ -6,19 +6,19 @@ what actually stops copying: PDF permissions are only honoured by viewers.
 """
 
 import io
+import math
 import os
 import shutil
 import signal
 import subprocess
 import zipfile
-from functools import lru_cache
 from pathlib import Path
 from typing import BinaryIO
 
 import pikepdf
 import pypdfium2 as pdfium
 from lxml import etree
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageStat
 
 APP_NAME = "Encreept"
 
@@ -26,6 +26,14 @@ MAX_PAGES = int(os.environ.get("ENCREEPT_MAX_PAGES", "400"))
 CONVERT_TIMEOUT_SECONDS = int(os.environ.get("ENCREEPT_CONVERT_TIMEOUT", "900"))
 # Caps the memory one page can use, however large its physical size is.
 MAX_PAGE_SIDE_PX = 3000
+
+# Longer labels would shrink too far to read as a bold line across a portrait page.
+MAX_WATERMARK_CHARS = 25
+WATERMARK_FONT = str(Path(__file__).parent / "fonts" / "DejaVuSans-Bold.ttf")
+WATERMARK_OPACITY = 36  # Out of 255.
+WATERMARK_PAGE_SHARE = 0.86  # The rotated text's share of the page's width and height.
+WATERMARK_MAX_HEIGHT_SHARE = 0.2  # Stops short labels from becoming enormous.
+
 # LibreOffice loads one piece at a time, which keeps long decks within 512 MB of memory.
 SLIDES_PER_CONVERSION = 20
 
@@ -229,60 +237,56 @@ def _convert_document(source: Path, extension: str, workdir: Path) -> list[Path]
     return converted
 
 
-@lru_cache(maxsize=8)
-def _watermark_tile(font_px: int) -> Image.Image:
-    """One rotated logo-and-name stamp. Dark ink with a light edge shows on any page colour."""
-    font = ImageFont.load_default(size=font_px)
-    ink = (20, 38, 79, 62)
-    edge = (255, 255, 255, 62)
-    stroke = max(1, font_px // 24)
+def clean_watermark(label: str) -> str:
+    """Tidy a watermark label, or raise if it's too long or the font can't draw it."""
+    cleaned = " ".join(label.split())
+    if len(cleaned) > MAX_WATERMARK_CHARS:
+        raise ProtectionError(f"The watermark can be up to {MAX_WATERMARK_CHARS} characters.")
 
-    measure = ImageDraw.Draw(Image.new("L", (1, 1)))
-    left, top, right, bottom = measure.textbbox((0, 0), APP_NAME, font=font, stroke_width=stroke)
-    text_w, text_h = right - left, bottom - top
+    font = ImageFont.truetype(WATERMARK_FONT, 32)
 
-    icon_w = int(font_px * 0.8)
-    gap = font_px // 3
-    pad = font_px // 4
-    stamp = Image.new("RGBA", (icon_w + gap + text_w + pad * 2, max(text_h, font_px) + pad * 2), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(stamp)
+    def glyph(character: str) -> bytes:
+        image = Image.new("L", (64, 64))
+        ImageDraw.Draw(image).text((8, 8), character, font=font, fill=255)
+        return image.tobytes()
 
-    # Padlock logo: shackle over a solid body.
-    body_top = pad + int(font_px * 0.42)
-    body_bottom = pad + int(font_px * 0.98)
-    line = max(2, font_px // 10)
-    shackle = (pad + icon_w * 0.18, pad, pad + icon_w * 0.82, body_top + font_px * 0.3)
-    draw.arc(shackle, 180, 360, fill=edge, width=line + stroke * 2)
-    draw.arc(shackle, 180, 360, fill=ink, width=line)
-    draw.rounded_rectangle(
-        (pad, body_top, pad + icon_w, body_bottom),
-        radius=font_px // 10,
-        fill=ink,
-        outline=edge,
-        width=stroke,
+    missing_glyph = glyph("￿")
+    unsupported = sorted(
+        {c for c in cleaned if c != " " and (not c.isprintable() or glyph(c) == missing_glyph)}
     )
-    draw.text(
-        (pad + icon_w + gap - left, pad - top),
-        APP_NAME,
-        font=font,
-        fill=ink,
-        stroke_width=stroke,
-        stroke_fill=edge,
-    )
-    return stamp.rotate(30, expand=True, resample=Image.Resampling.BICUBIC)
+    if unsupported:
+        raise ProtectionError(f"The watermark can't use: {' '.join(unsupported)}")
+    return cleaned
 
 
-def _apply_watermark(page: Image.Image) -> Image.Image:
+def _apply_watermark(page: Image.Image, label: str) -> Image.Image:
+    """Draw one faint bold line through the page centre, corner to corner, sized to fit."""
     width, height = page.size
-    tile = _watermark_tile(max(16, min(width, height) // 20))
-    step_x, step_y = int(tile.width * 1.25), int(tile.height * 1.1)
+    angle = math.atan2(height, width)
+    cos, sin = math.cos(angle), math.sin(angle)
 
-    overlay = Image.new("RGBA", page.size, (0, 0, 0, 0))
-    for row, y in enumerate(range(-tile.height // 2, height, step_y)):
-        offset = step_x // 2 if row % 2 else 0
-        for x in range(-tile.width // 2 - offset, width, step_x):
-            overlay.paste(tile, (x, y))
-    return Image.alpha_composite(page.convert("RGBA"), overlay).convert("RGB")
+    # Measure at a fixed size, then scale so the rotated text stays inside the page.
+    left, top, right, bottom = ImageFont.truetype(WATERMARK_FONT, 100).getbbox(label)
+    text_w, text_h = right - left, bottom - top
+    fit = min(
+        WATERMARK_PAGE_SHARE * width / (text_w * cos + text_h * sin),
+        WATERMARK_PAGE_SHARE * height / (text_w * sin + text_h * cos),
+    )
+    font_px = max(8, min(int(100 * fit), int(min(width, height) * WATERMARK_MAX_HEIGHT_SHARE)))
+    font = ImageFont.truetype(WATERMARK_FONT, font_px)
+
+    left, top, right, bottom = font.getbbox(label)
+    mask = Image.new("L", (right - left, bottom - top), 0)
+    ImageDraw.Draw(mask).text((-left, -top), label, font=font, fill=WATERMARK_OPACITY)
+    mask = mask.rotate(math.degrees(angle), expand=True, resample=Image.Resampling.BICUBIC)
+
+    page = page.convert("RGB")
+    box = ((width - mask.width) // 2, (height - mask.height) // 2)
+    # Dark text on light pages, light text on dark ones.
+    behind = page.convert("L").crop((*box, box[0] + mask.width, box[1] + mask.height))
+    colour = (40, 40, 40) if ImageStat.Stat(behind).mean[0] > 110 else (255, 255, 255)
+    page.paste(colour, box, mask)
+    return page
 
 
 class _ImagePdfWriter:
@@ -348,7 +352,7 @@ def _open_pdf(path: Path) -> pdfium.PdfDocument:
         ) from None
 
 
-def _rasterise_to_pdf(sources: list[Path], preset: dict, destination: Path) -> None:
+def _rasterise_to_pdf(sources: list[Path], preset: dict, watermark: str, destination: Path) -> None:
     page_count = 0
     for source in sources:
         document = _open_pdf(source)
@@ -372,7 +376,9 @@ def _rasterise_to_pdf(sources: list[Path], preset: dict, destination: Path) -> N
                         size_pt = page.get_size()
                         scale = min(preset["dpi"] / 72, MAX_PAGE_SIDE_PX / max(size_pt))
                         bitmap = page.render(scale=scale, may_draw_forms=True)
-                        image = _apply_watermark(bitmap.to_pil())
+                        image = bitmap.to_pil().convert("RGB")
+                        if watermark:
+                            image = _apply_watermark(image, watermark)
                         bitmap.close()
                     finally:
                         page.close()
@@ -411,14 +417,17 @@ def _write_locked(pdf: pikepdf.Pdf, owner_password: str, destination: Path) -> N
     pdf.save(destination, encryption=pikepdf.Encryption(owner=owner_password, user="", R=6, allow=permissions))
 
 
-def protect_document(upload: BinaryIO, filename: str, quality: str, owner_password: str, workdir: Path) -> Path:
-    """Run the pipeline and return the finished PDF. The caller owns and deletes workdir."""
+def protect_document(
+    upload: BinaryIO, filename: str, quality: str, watermark: str, owner_password: str, workdir: Path
+) -> Path:
+    """Run the pipeline and return the finished PDF. An empty watermark adds none. The caller owns and deletes workdir."""
     extension = Path(filename).suffix.lower()
     if extension not in SUPPORTED_EXTENSIONS:
         raise ProtectionError("Upload a PDF, Word (.doc, .docx) or PowerPoint (.ppt, .pptx) file.")
     preset = QUALITY_PRESETS.get(quality)
     if preset is None:
         raise ProtectionError("Choose standard or high quality.")
+    watermark = clean_watermark(watermark)
 
     # A fixed name keeps the user's filename away from the file system and command line.
     source = workdir / f"input{extension}"
@@ -428,7 +437,7 @@ def protect_document(upload: BinaryIO, filename: str, quality: str, owner_passwo
     _validate_file(source, extension)
     pdf_paths = [source] if extension == ".pdf" else _convert_document(source, extension, workdir)
     plain_pdf = workdir / "pages.pdf"
-    _rasterise_to_pdf(pdf_paths, preset, plain_pdf)
+    _rasterise_to_pdf(pdf_paths, preset, watermark, plain_pdf)
     destination = workdir / "output.pdf"
     _save_locked(plain_pdf, owner_password, destination)
     return destination

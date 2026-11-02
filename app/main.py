@@ -57,7 +57,10 @@ def healthz() -> dict:
 
 @app.post("/api/protect")
 async def protect(
-    background_tasks: BackgroundTasks, file: UploadFile = File(...), quality: str = Form("standard")
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    quality: str = Form("standard"),
+    watermark: str = Form(""),
 ) -> Response:
     filename = file.filename or ""
     if file.size == 0:
@@ -71,7 +74,7 @@ async def protect(
         async with processing_slot:
             try:
                 result = await run_in_threadpool(
-                    protect_document, file.file, filename, quality, OWNER_PASSWORD, Path(workdir)
+                    protect_document, file.file, filename, quality, watermark, OWNER_PASSWORD, Path(workdir)
                 )
             except ProtectionError as error:
                 raise HTTPException(status_code=400, detail=str(error)) from None

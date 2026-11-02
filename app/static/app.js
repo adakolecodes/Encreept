@@ -8,6 +8,8 @@ const input = document.getElementById("file");
 const title = document.getElementById("drop-title");
 const submit = document.getElementById("submit");
 const statusLine = document.getElementById("status");
+const watermarkOn = document.getElementById("watermark-on");
+const watermarkLabel = document.getElementById("watermark-label");
 
 function drawSeal() {
   // A rosette of interlaced hypotrochoid bands.
@@ -70,6 +72,11 @@ async function errorMessage(response) {
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!input.files.length) return;
+  if (watermarkOn.checked && !watermarkLabel.value.trim()) {
+    setStatus("Enter the watermark text, or untick Add a watermark.", true);
+    watermarkLabel.focus();
+    return;
+  }
 
   submit.disabled = true;
   sheet.dataset.state = "working";
@@ -96,6 +103,22 @@ form.addEventListener("submit", async (event) => {
     submit.disabled = false;
   }
 });
+
+function updateWatermarkCount() {
+  const left = watermarkLabel.maxLength - watermarkLabel.value.length;
+  document.getElementById("watermark-count").textContent =
+    `${left} of ${watermarkLabel.maxLength} characters left`;
+}
+
+watermarkOn.addEventListener("change", () => {
+  // A disabled field isn't sent, so an unticked box means no watermark.
+  document.getElementById("watermark-fields").hidden = !watermarkOn.checked;
+  watermarkLabel.disabled = !watermarkOn.checked;
+  if (watermarkOn.checked) watermarkLabel.focus();
+  else setStatus("");
+});
+
+watermarkLabel.addEventListener("input", updateWatermarkCount);
 
 input.addEventListener("change", () => {
   if (input.files.length) chooseFile(input.files[0]);

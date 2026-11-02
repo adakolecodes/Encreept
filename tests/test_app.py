@@ -97,12 +97,60 @@ def test_page_size_and_rotation_are_kept(client):
     assert document[0].get_size() == pytest.approx((400, 800), abs=0.1)
 
 
-def test_watermark_marks_the_page(client):
-    response = upload(client, make_pdf(pages=1))
-    image = pdfium.PdfDocument(response.content)[0].render(scale=1).to_pil().convert("L")
-    # The top of the source page is blank, so anything darker than paper is the watermark.
-    top = image.crop((0, 0, image.width, 200))
-    assert top.getextrema()[0] < 225
+def render_blank_page(client, size=(612, 792), **form):
+    source = pikepdf.new()
+    source.add_blank_page(page_size=size)
+    buffer = io.BytesIO()
+    source.save(buffer)
+    response = upload(client, buffer.getvalue(), **form)
+    assert response.status_code == 200
+    return pdfium.PdfDocument(response.content)[0].render(scale=1).to_pil().convert("L")
+
+
+def test_no_watermark_by_default(client):
+    assert render_blank_page(client).getextrema()[0] > 240
+
+
+@pytest.mark.parametrize("size", [(612, 792), (960, 540), (400, 400)])
+@pytest.mark.parametrize("label", ["Hi", "Confidential", "W" * protect.MAX_WATERMARK_CHARS])
+def test_watermark_is_faint_centred_and_fits(client, size, label):
+    image = render_blank_page(client, size=size, watermark=label)
+    marked = image.point(lambda value: 255 if value < 240 else 0)
+    left, top, right, bottom = marked.getbbox()
+
+    # Faint, but visible.
+    assert 190 < image.getextrema()[0] < 240
+    # Inside the page, not touching its edges, and centred.
+    assert left > 0 and top > 0 and right < image.width and bottom < image.height
+    assert abs((left + right) / 2 - image.width / 2) < image.width * 0.02
+    assert abs((top + bottom) / 2 - image.height / 2) < image.height * 0.02
+
+
+def test_watermark_is_light_on_dark_pages():
+    page = protect.Image.new("RGB", (600, 400), (10, 10, 30))
+    assert protect._apply_watermark(page, "Draft").convert("L").getextrema()[1] > 30
+
+
+def test_watermark_label_is_tidied():
+    assert protect.clean_watermark("  My   Draft  ") == "My Draft"
+
+
+def test_watermark_character_limit(client):
+    assert upload(client, make_pdf(pages=1), watermark="x" * protect.MAX_WATERMARK_CHARS).status_code == 200
+    response = upload(client, make_pdf(pages=1), watermark="x" * (protect.MAX_WATERMARK_CHARS + 1))
+    assert response.status_code == 400
+    assert "up to 25" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("label", ["Café Müller", "Привет", "Draft © 2026 & Co."])
+def test_watermark_accepts_accents_and_symbols(label):
+    assert protect.clean_watermark(label) == label
+
+
+def test_watermark_rejects_characters_the_font_lacks(client):
+    response = upload(client, make_pdf(pages=1), watermark="你好")
+    assert response.status_code == 400
+    assert "can't use" in response.json()["detail"]
 
 
 def test_high_quality_produces_more_pixels(client):

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Encreept</title>
-  <meta name="description" content="Turn a PDF, Word or PowerPoint file into a watermarked PDF that can be read but not copied.">
+  <meta name="description" content="Turn a PDF, Word or PowerPoint file into a locked PDF that can be read but not copied.">
   <link rel="icon" href="/logo.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -20,12 +20,12 @@
   <main class="layout">
     <section class="pitch">
       <h1>Let them read it. Stop them lifting it.</h1>
-      <p class="lede">Encreept redraws every page of your document as a watermarked image, then locks the PDF. There's no text left to select, so nobody can copy a paragraph out of it.</p>
+      <p class="lede">Encreept redraws every page of your document as an image, then locks the PDF. There's no text left to select, so nobody can copy a paragraph out of it.</p>
 
       <h2>What happens to your file</h2>
       <ol class="steps">
         <li>Word and PowerPoint files are converted to PDF.</li>
-        <li>Each page becomes an image stamped with the Encreept watermark.</li>
+        <li>Each page becomes an image, with your watermark if you add one.</li>
         <li>The new PDF is encrypted, with copying, printing and editing turned off.</li>
         <li>You download it, and the server deletes its working copies.</li>
       </ol>
@@ -47,6 +47,15 @@
           <label><input type="radio" name="quality" value="high"><span>High<small>Sharper small print</small></span></label>
         </fieldset>
 
+        <div class="watermark">
+          <label class="watermark-toggle"><input id="watermark-on" type="checkbox"> Add a watermark</label>
+          <div id="watermark-fields" hidden>
+            <label for="watermark-label">Watermark text</label>
+            <input id="watermark-label" name="watermark" type="text" maxlength="25" autocomplete="off" disabled>
+            <small id="watermark-count">Up to 25 characters</small>
+          </div>
+        </div>
+
         <button id="submit" type="submit" disabled>Protect document</button>
         <p id="status" class="status" role="status" aria-live="polite"></p>
       </form>
@@ -54,7 +63,7 @@
   </main>
 
   <footer class="limits">
-    <p><strong>What this can't stop.</strong> Anyone who can see a page can photograph it or run text recognition on a screenshot, and some PDF tools ignore lock settings. The watermark stays in those copies, and copying takes real effort. Keep your original: Encreept's PDFs can't be turned back into editable documents.</p>
+    <p><strong>What this can't stop.</strong> Anyone who can see a page can photograph it or run text recognition on a screenshot, and some PDF tools ignore lock settings. A watermark stays in those copies, and copying takes real effort. Keep your original: Encreept's PDFs can't be turned back into editable documents.</p>
   </footer>
 
   <script src="/app.js"></script>

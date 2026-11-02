@@ -5,11 +5,11 @@ A small FastAPI app that turns a PDF, Word or PowerPoint file into a PDF that ca
 ## How it works
 
 1. Word and PowerPoint files are converted to PDF with LibreOffice.
-2. Each page is rendered to an image and stamped with a tiled Encreept watermark. This removes all text, fonts, links and original metadata.
+2. Each page is rendered to an image, which removes all text, fonts, links and original metadata. If you add a watermark (up to 25 characters), it's drawn into the image as one faint bold line through the centre of the page.
 3. The images are assembled into a new PDF at the original page size.
 4. The PDF is encrypted with AES-256. It opens without a password, but copying, printing and editing are turned off and require the owner password.
 
-Step 2 does the real work. PDF permissions are only honoured by well-behaved viewers, and some tools ignore them. Screenshots and text recognition remain possible, which is why the watermark is part of each image.
+Step 2 does the real work. PDF permissions are only honoured by well-behaved viewers, and some tools ignore them. Screenshots and text recognition remain possible, which is why a watermark is part of each image.
 
 ## Run locally
 
