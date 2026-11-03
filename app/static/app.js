@@ -1,15 +1,18 @@
 const MAX_BYTES = 60 * 1024 * 1024;
-const EXTENSIONS = [".pdf", ".doc", ".docx", ".ppt", ".pptx"];
 
 const sheet = document.querySelector(".sheet");
 const form = document.getElementById("form");
-const drop = document.getElementById("drop");
-const input = document.getElementById("file");
-const title = document.getElementById("drop-title");
 const submit = document.getElementById("submit");
 const statusLine = document.getElementById("status");
 const watermarkOn = document.getElementById("watermark-on");
 const watermarkLabel = document.getElementById("watermark-label");
+const secondSlot = document.getElementById("image-slot-2");
+const addImage = document.getElementById("add-image");
+
+const MODES = {
+  protect: { endpoint: "/api/protect", button: "Protect document", done: "Protected" },
+  insert: { endpoint: "/api/insert", button: "Add images and protect", done: "Images added and protected" },
+};
 
 function drawSeal() {
   // A rosette of interlaced hypotrochoid bands.
@@ -38,21 +41,108 @@ function setStatus(message, isError = false) {
   statusLine.classList.toggle("is-error", isError);
 }
 
-function chooseFile(file) {
-  sheet.dataset.state = "";
-  const extension = file.name.slice(file.name.lastIndexOf(".")).toLowerCase();
-  if (!EXTENSIONS.includes(extension)) {
-    submit.disabled = true;
-    return setStatus("Choose a PDF, Word (.doc, .docx) or PowerPoint (.ppt, .pptx) file.", true);
+function extensionOf(name) {
+  return name.slice(name.lastIndexOf(".")).toLowerCase();
+}
+
+// A drop zone that remembers one chosen file of the allowed types.
+function dropZone(id, extensions, wrongType) {
+  const zone = document.getElementById(id);
+  const input = zone.querySelector("input");
+  const title = zone.querySelector("[data-title]");
+  const hint = zone.querySelector("[data-hint]");
+  const empty = { title: title.textContent, hint: hint.textContent };
+  const state = { file: null };
+
+  state.clear = () => {
+    state.file = null;
+    input.value = "";
+    title.textContent = empty.title;
+    hint.textContent = empty.hint;
+  };
+
+  function choose(file) {
+    sheet.dataset.state = "";
+    if (!extensions.includes(extensionOf(file.name))) {
+      state.clear();
+      return setStatus(wrongType, true);
+    }
+    state.file = file;
+    title.textContent = file.name;
+    hint.textContent = "Choose or drop another file to replace it.";
+    setStatus("");
   }
-  if (file.size > MAX_BYTES) {
-    submit.disabled = true;
-    return setStatus("This file is over the 60 MB limit.", true);
+
+  input.addEventListener("change", () => {
+    if (input.files.length) choose(input.files[0]);
+  });
+  for (const type of ["dragenter", "dragover"]) {
+    zone.addEventListener(type, (event) => {
+      event.preventDefault();
+      zone.classList.add("is-over");
+    });
   }
-  title.textContent = file.name;
-  document.getElementById("drop-hint").textContent = "Choose or drop another file to replace it.";
-  submit.disabled = false;
-  setStatus("");
+  for (const type of ["dragleave", "drop"]) {
+    zone.addEventListener(type, (event) => {
+      event.preventDefault();
+      zone.classList.remove("is-over");
+    });
+  }
+  zone.addEventListener("drop", (event) => {
+    if (event.dataTransfer.files.length) choose(event.dataTransfer.files[0]);
+  });
+  return state;
+}
+
+const IMAGE_TYPES = [".png", ".jpg", ".jpeg"];
+const zones = {
+  document: dropZone(
+    "document-drop",
+    [".pdf", ".doc", ".docx", ".ppt", ".pptx"],
+    "Choose a PDF, Word (.doc, .docx) or PowerPoint (.ppt, .pptx) file.",
+  ),
+  pdf: dropZone("pdf-drop", [".pdf"], "Choose a PDF file. To protect a Word or PowerPoint file, use Protect a document."),
+  image1: dropZone("image-drop-1", IMAGE_TYPES, "Choose a PNG or JPEG image."),
+  image2: dropZone("image-drop-2", IMAGE_TYPES, "Choose a PNG or JPEG image."),
+};
+
+function currentMode() {
+  return form.elements.mode.value;
+}
+
+// Returns the form to send, or an error message to show.
+function buildUpload() {
+  const body = new FormData();
+  if (currentMode() === "protect") {
+    if (!zones.document.file) return "Choose a document first.";
+    body.append("file", zones.document.file);
+  } else {
+    if (!zones.pdf.file) return "Choose a PDF first.";
+    body.append("file", zones.pdf.file);
+    for (const number of secondSlot.hidden ? [1] : [1, 2]) {
+      const image = zones[`image${number}`].file;
+      if (!image) return number === 1 ? "Choose image 1." : "Choose image 2, or remove it.";
+      const position = document.getElementById(`position-${number}`).value;
+      body.append(`image${number}`, image);
+      body.append(`position${number}`, position);
+      if (position === "before") {
+        const page = document.getElementById(`page-${number}`).value.trim();
+        if (!/^[1-9]\d*$/.test(page)) return `Enter the page that image ${number} goes before.`;
+        body.append(`page${number}`, page);
+      }
+    }
+  }
+
+  if (watermarkOn.checked) {
+    if (!watermarkLabel.value.trim()) return "Enter the watermark text, or untick Add a watermark.";
+    body.append("watermark", watermarkLabel.value);
+  }
+  body.append("quality", form.elements.quality.value);
+
+  let total = 0;
+  for (const value of body.values()) if (value instanceof File) total += value.size;
+  if (total > MAX_BYTES) return "These files are over the 60 MB limit together.";
+  return body;
 }
 
 function downloadName(response) {
@@ -71,19 +161,16 @@ async function errorMessage(response) {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (!input.files.length) return;
-  if (watermarkOn.checked && !watermarkLabel.value.trim()) {
-    setStatus("Enter the watermark text, or untick Add a watermark.", true);
-    watermarkLabel.focus();
-    return;
-  }
+  const body = buildUpload();
+  if (typeof body === "string") return setStatus(body, true);
+  const mode = MODES[currentMode()];
 
   submit.disabled = true;
   sheet.dataset.state = "working";
-  setStatus("Protecting your document. Keep this page open: long files can take several minutes or more.");
+  setStatus("Working on your document. Keep this page open: long files can take several minutes or more.");
 
   try {
-    const response = await fetch("/api/protect", { method: "POST", body: new FormData(form) });
+    const response = await fetch(mode.endpoint, { method: "POST", body });
     if (!response.ok) {
       sheet.dataset.state = "";
       return setStatus(await errorMessage(response), true);
@@ -95,13 +182,49 @@ form.addEventListener("submit", async (event) => {
     link.click();
     setTimeout(() => URL.revokeObjectURL(url), 60000);
     sheet.dataset.state = "done";
-    setStatus(`Protected. ${link.download} is in your downloads.`);
+    setStatus(`${mode.done}. ${link.download} is in your downloads.`);
   } catch {
     sheet.dataset.state = "";
     setStatus("The connection dropped before the document was ready. Check your connection and try again.", true);
   } finally {
     submit.disabled = false;
   }
+});
+
+for (const radio of form.elements.mode) {
+  radio.addEventListener("change", () => {
+    const insert = currentMode() === "insert";
+    document.getElementById("protect-fields").hidden = insert;
+    document.getElementById("insert-fields").hidden = !insert;
+    submit.textContent = MODES[currentMode()].button;
+    sheet.dataset.state = "";
+    setStatus("");
+  });
+}
+
+for (const number of [1, 2]) {
+  const position = document.getElementById(`position-${number}`);
+  const page = document.getElementById(`page-${number}`);
+  position.addEventListener("change", () => {
+    page.hidden = position.value !== "before";
+    if (!page.hidden) page.focus();
+  });
+}
+
+addImage.addEventListener("click", () => {
+  secondSlot.hidden = false;
+  addImage.hidden = true;
+  document.querySelector("#image-drop-2 input").focus();
+});
+
+document.getElementById("remove-image").addEventListener("click", () => {
+  zones.image2.clear();
+  document.getElementById("position-2").value = "last";
+  document.getElementById("page-2").hidden = true;
+  secondSlot.hidden = true;
+  addImage.hidden = false;
+  addImage.focus();
+  setStatus("");
 });
 
 function updateWatermarkCount() {
@@ -111,7 +234,6 @@ function updateWatermarkCount() {
 }
 
 watermarkOn.addEventListener("change", () => {
-  // A disabled field isn't sent, so an unticked box means no watermark.
   document.getElementById("watermark-fields").hidden = !watermarkOn.checked;
   watermarkLabel.disabled = !watermarkOn.checked;
   if (watermarkOn.checked) watermarkLabel.focus();
@@ -119,27 +241,5 @@ watermarkOn.addEventListener("change", () => {
 });
 
 watermarkLabel.addEventListener("input", updateWatermarkCount);
-
-input.addEventListener("change", () => {
-  if (input.files.length) chooseFile(input.files[0]);
-});
-
-for (const type of ["dragenter", "dragover"]) {
-  drop.addEventListener(type, (event) => {
-    event.preventDefault();
-    drop.classList.add("is-over");
-  });
-}
-for (const type of ["dragleave", "drop"]) {
-  drop.addEventListener(type, (event) => {
-    event.preventDefault();
-    drop.classList.remove("is-over");
-  });
-}
-drop.addEventListener("drop", (event) => {
-  if (!event.dataTransfer.files.length) return;
-  input.files = event.dataTransfer.files;
-  chooseFile(input.files[0]);
-});
 
 drawSeal();

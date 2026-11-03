@@ -12,13 +12,14 @@ import shutil
 import signal
 import subprocess
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
 import pikepdf
 import pypdfium2 as pdfium
 from lxml import etree
-from PIL import Image, ImageDraw, ImageFont, ImageStat
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageStat
 
 APP_NAME = "Encreept"
 
@@ -52,6 +53,10 @@ OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 # Extension -> folder that must exist inside the Office zip package.
 OOXML_FOLDERS = {".docx": "word/", ".pptx": "ppt/"}
 SUPPORTED_EXTENSIONS = {".pdf", ".doc", ".ppt", *OOXML_FOLDERS}
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+MAX_IMAGES = 2
+MAX_IMAGE_PIXELS = 50_000_000
 
 
 class ProtectionError(ValueError):
@@ -352,44 +357,101 @@ def _open_pdf(path: Path) -> pdfium.PdfDocument:
         ) from None
 
 
-def _rasterise_to_pdf(sources: list[Path], preset: dict, watermark: str, destination: Path) -> None:
-    page_count = 0
-    for source in sources:
-        document = _open_pdf(source)
-        page_count += len(document)
-        document.close()
-    if page_count == 0:
-        raise ProtectionError("This document has no pages.")
-    if page_count > MAX_PAGES:
-        raise ProtectionError(
-            f"This document has {page_count} pages. The limit is {MAX_PAGES}."
-        )
+@dataclass(frozen=True)
+class _PdfPage:
+    path: Path
+    index: int
+    size_pt: tuple[float, float]
 
-    with destination.open("wb") as handle:
-        writer = _ImagePdfWriter(handle)
-        for source in sources:
-            document = _open_pdf(source)
-            try:
-                for index in range(len(document)):
-                    page = document[index]
+
+@dataclass(frozen=True)
+class _ImagePage:
+    path: Path
+    size_pt: tuple[float, float]
+    label: str
+
+
+def _pdf_pages(paths: list[Path]) -> list[_PdfPage]:
+    pages = []
+    for path in paths:
+        document = _open_pdf(path)
+        try:
+            for index in range(len(document)):
+                page = document[index]
+                pages.append(_PdfPage(path, index, page.get_size()))
+                page.close()
+        finally:
+            document.close()
+    return pages
+
+
+def _render_scale(size_pt: tuple[float, float], preset: dict) -> float:
+    return min(preset["dpi"] / 72, MAX_PAGE_SIDE_PX / max(size_pt))
+
+
+def _render_image_page(page: _ImagePage, preset: dict) -> Image.Image:
+    """Fit the image inside a white page of the given size, centred."""
+    scale = _render_scale(page.size_pt, preset)
+    width, height = round(page.size_pt[0] * scale), round(page.size_pt[1] * scale)
+    try:
+        with Image.open(page.path) as source:
+            # Decodes a large JPEG at a reduced size, which saves memory.
+            source.draft("RGB", (max(width, height), max(width, height)))
+            image = ImageOps.exif_transpose(source)
+            if image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info:
+                rgba = image.convert("RGBA")
+                image = Image.new("RGB", rgba.size, "white")
+                image.paste(rgba, mask=rgba.getchannel("A"))
+            else:
+                image = image.convert("RGB")
+    except OSError:
+        raise ProtectionError(f"{page.label} couldn't be read. It may be damaged.") from None
+
+    fit = min(width / image.width, height / image.height)
+    image = image.resize(
+        (max(1, round(image.width * fit)), max(1, round(image.height * fit))), Image.Resampling.LANCZOS
+    )
+    canvas = Image.new("RGB", (width, height), "white")
+    canvas.paste(image, ((width - image.width) // 2, (height - image.height) // 2))
+    return canvas
+
+
+def _rasterise_to_pdf(
+    pages: list[_PdfPage | _ImagePage], preset: dict, watermark: str, destination: Path
+) -> None:
+    if not pages:
+        raise ProtectionError("This document has no pages.")
+    if len(pages) > MAX_PAGES:
+        raise ProtectionError(f"This document has {len(pages)} pages. The limit is {MAX_PAGES}.")
+
+    documents: dict[Path, pdfium.PdfDocument] = {}
+    try:
+        with destination.open("wb") as handle:
+            writer = _ImagePdfWriter(handle)
+            for item in pages:
+                if isinstance(item, _ImagePage):
+                    image = _render_image_page(item, preset)
+                else:
+                    if item.path not in documents:
+                        documents[item.path] = _open_pdf(item.path)
+                    page = documents[item.path][item.index]
                     try:
-                        size_pt = page.get_size()
-                        scale = min(preset["dpi"] / 72, MAX_PAGE_SIDE_PX / max(size_pt))
-                        bitmap = page.render(scale=scale, may_draw_forms=True)
+                        bitmap = page.render(scale=_render_scale(item.size_pt, preset), may_draw_forms=True)
                         image = bitmap.to_pil().convert("RGB")
-                        if watermark:
-                            image = _apply_watermark(image, watermark)
                         bitmap.close()
                     finally:
                         page.close()
+                if watermark:
+                    image = _apply_watermark(image, watermark)
 
-                    buffer = io.BytesIO()
-                    image.save(buffer, format="JPEG", quality=preset["jpeg_quality"], optimize=True)
-                    writer.add_page(buffer.getvalue(), image.size, size_pt)
-                    image.close()
-            finally:
-                document.close()
-        writer.finish()
+                buffer = io.BytesIO()
+                image.save(buffer, format="JPEG", quality=preset["jpeg_quality"], optimize=True)
+                writer.add_page(buffer.getvalue(), image.size, item.size_pt)
+                image.close()
+            writer.finish()
+    finally:
+        for document in documents.values():
+            document.close()
 
 
 def _save_locked(plain_pdf: Path, owner_password: str, destination: Path) -> None:
@@ -417,6 +479,28 @@ def _write_locked(pdf: pikepdf.Pdf, owner_password: str, destination: Path) -> N
     pdf.save(destination, encryption=pikepdf.Encryption(owner=owner_password, user="", R=6, allow=permissions))
 
 
+def _check_options(quality: str, watermark: str) -> tuple[dict, str]:
+    preset = QUALITY_PRESETS.get(quality)
+    if preset is None:
+        raise ProtectionError("Choose standard or high quality.")
+    return preset, clean_watermark(watermark)
+
+
+def _save_upload(upload: BinaryIO, path: Path, label: str) -> None:
+    with path.open("wb") as handle:
+        shutil.copyfileobj(upload, handle)
+    if path.stat().st_size == 0:
+        raise ProtectionError(f"{label} is empty.")
+
+
+def _finish(pages: list[_PdfPage | _ImagePage], preset: dict, watermark: str, owner_password: str, workdir: Path) -> Path:
+    plain_pdf = workdir / "pages.pdf"
+    _rasterise_to_pdf(pages, preset, watermark, plain_pdf)
+    destination = workdir / "output.pdf"
+    _save_locked(plain_pdf, owner_password, destination)
+    return destination
+
+
 def protect_document(
     upload: BinaryIO, filename: str, quality: str, watermark: str, owner_password: str, workdir: Path
 ) -> Path:
@@ -424,20 +508,93 @@ def protect_document(
     extension = Path(filename).suffix.lower()
     if extension not in SUPPORTED_EXTENSIONS:
         raise ProtectionError("Upload a PDF, Word (.doc, .docx) or PowerPoint (.ppt, .pptx) file.")
-    preset = QUALITY_PRESETS.get(quality)
-    if preset is None:
-        raise ProtectionError("Choose standard or high quality.")
-    watermark = clean_watermark(watermark)
+    preset, watermark = _check_options(quality, watermark)
 
-    # A fixed name keeps the user's filename away from the file system and command line.
+    # Fixed names keep the user's filenames away from the file system and command line.
     source = workdir / f"input{extension}"
-    with source.open("wb") as handle:
-        shutil.copyfileobj(upload, handle)
-
+    _save_upload(upload, source, "This file")
     _validate_file(source, extension)
     pdf_paths = [source] if extension == ".pdf" else _convert_document(source, extension, workdir)
-    plain_pdf = workdir / "pages.pdf"
-    _rasterise_to_pdf(pdf_paths, preset, watermark, plain_pdf)
-    destination = workdir / "output.pdf"
-    _save_locked(plain_pdf, owner_password, destination)
-    return destination
+    return _finish(_pdf_pages(pdf_paths), preset, watermark, owner_password, workdir)
+
+
+@dataclass(frozen=True)
+class ImageInsert:
+    """An image to add as a page. Page numbers count the PDF's pages as uploaded."""
+
+    upload: BinaryIO
+    filename: str
+    position: str  # "first", "last" or "before".
+    page: str = ""  # The page the image goes before, when position is "before".
+
+
+def _validate_image(path: Path, label: str) -> None:
+    try:
+        with Image.open(path) as image:
+            image_format, (width, height) = image.format, image.size
+    except (OSError, Image.DecompressionBombError):
+        image_format = None
+    if image_format not in ("PNG", "JPEG"):
+        raise ProtectionError(f"{label} isn't a valid PNG or JPEG image. It may be damaged.")
+    if width * height > MAX_IMAGE_PIXELS:
+        raise ProtectionError(
+            f"{label} is {width} × {height} pixels. The limit is {MAX_IMAGE_PIXELS // 1_000_000} megapixels."
+        )
+
+
+def _insert_slot(insert: ImageInsert, label: str, page_count: int) -> int:
+    """How many of the PDF's pages come before the image."""
+    if insert.position == "first":
+        return 0
+    if insert.position == "last":
+        return page_count
+    if insert.position != "before":
+        raise ProtectionError(f"Choose where {label.lower()} goes.")
+    page = insert.page.strip()
+    if not page.isdigit() or not 1 <= int(page) <= page_count:
+        raise ProtectionError(
+            f"The page for {label.lower()} must be a number from 1 to {page_count}. "
+            "To put it after the last page, choose last page."
+        )
+    return int(page) - 1
+
+
+def insert_images(
+    pdf_upload: BinaryIO,
+    images: list[ImageInsert],
+    quality: str,
+    watermark: str,
+    owner_password: str,
+    workdir: Path,
+) -> Path:
+    """Add one or two images to a PDF as pages, then protect it like any other document."""
+    preset, watermark = _check_options(quality, watermark)
+    if not 1 <= len(images) <= MAX_IMAGES:
+        raise ProtectionError(f"Add one or {MAX_IMAGES} images.")
+
+    source = workdir / "input.pdf"
+    _save_upload(pdf_upload, source, "The PDF")
+    _validate_file(source, ".pdf")
+    pages = _pdf_pages([source])
+    if not pages:
+        raise ProtectionError("This PDF has no pages.")
+
+    placed = []
+    for number, insert in enumerate(images, start=1):
+        label = f"Image {number}"
+        extension = Path(insert.filename).suffix.lower()
+        if extension not in IMAGE_EXTENSIONS:
+            raise ProtectionError(f"{label} must be a PNG or JPEG file.")
+        path = workdir / f"image-{number}{extension}"
+        _save_upload(insert.upload, path, label)
+        _validate_image(path, label)
+        placed.append((_insert_slot(insert, label, len(pages)), path, label))
+
+    combined: list[_PdfPage | _ImagePage] = []
+    for slot in range(len(pages) + 1):
+        # Images take the size of the page they're placed before, or the last page.
+        neighbour = pages[min(slot, len(pages) - 1)]
+        combined += [_ImagePage(path, neighbour.size_pt, label) for s, path, label in placed if s == slot]
+        if slot < len(pages):
+            combined.append(pages[slot])
+    return _finish(combined, preset, watermark, owner_password, workdir)

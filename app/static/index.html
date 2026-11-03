@@ -25,7 +25,7 @@
       <h2>What happens to your file</h2>
       <ol class="steps">
         <li>Word and PowerPoint files are converted to PDF.</li>
-        <li>Each page becomes an image, with your watermark if you add one.</li>
+        <li>Each page becomes an image, along with any images you add, and gets your watermark if you choose one.</li>
         <li>The new PDF is encrypted, with copying, printing and editing turned off.</li>
         <li>You download it, and the server deletes its working copies.</li>
       </ol>
@@ -34,14 +34,69 @@
     <section class="sheet" aria-label="Protect a document">
       <svg id="seal" class="seal" viewBox="-100 -100 200 200" aria-hidden="true"></svg>
 
-      <form id="form">
-        <label id="drop" class="drop" for="file">
-          <input id="file" name="file" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx">
-          <strong id="drop-title">Choose a document</strong>
-          <span id="drop-hint">or drop it here. PDF, Word or PowerPoint, up to 60 MB and 400 pages.</span>
-        </label>
+      <form id="form" novalidate>
+        <fieldset class="choice mode">
+          <legend>What do you want to do?</legend>
+          <label><input type="radio" name="mode" value="protect" checked><span>Protect a document<small>PDF, Word or PowerPoint</small></span></label>
+          <label><input type="radio" name="mode" value="insert"><span>Add images to a PDF<small>Then protect it</small></span></label>
+        </fieldset>
 
-        <fieldset class="quality">
+        <div id="protect-fields">
+          <label class="drop" id="document-drop">
+            <input type="file" accept=".pdf,.doc,.docx,.ppt,.pptx">
+            <strong data-title>Choose a document</strong>
+            <span data-hint>or drop it here. PDF, Word or PowerPoint, up to 60 MB and 400 pages.</span>
+          </label>
+        </div>
+
+        <div id="insert-fields" hidden>
+          <label class="drop" id="pdf-drop">
+            <input type="file" accept=".pdf">
+            <strong data-title>Choose a PDF</strong>
+            <span data-hint>or drop it here. Up to 400 pages, and 60 MB with the images.</span>
+          </label>
+
+          <div class="image-slot" id="image-slot-1">
+            <label class="drop drop-small" id="image-drop-1">
+              <input type="file" accept=".png,.jpg,.jpeg">
+              <strong data-title>Choose image 1</strong>
+              <span data-hint>or drop it here. PNG or JPEG.</span>
+            </label>
+            <div class="placement">
+              <label for="position-1">Put image 1</label>
+              <select id="position-1">
+                <option value="first">as the first page</option>
+                <option value="last">as the last page</option>
+                <option value="before">before page</option>
+              </select>
+              <input id="page-1" type="number" min="1" inputmode="numeric" aria-label="Page number for image 1" hidden>
+            </div>
+          </div>
+
+          <button type="button" id="add-image" class="text-button">Add a second image</button>
+
+          <div class="image-slot" id="image-slot-2" hidden>
+            <label class="drop drop-small" id="image-drop-2">
+              <input type="file" accept=".png,.jpg,.jpeg">
+              <strong data-title>Choose image 2</strong>
+              <span data-hint>or drop it here. PNG or JPEG.</span>
+            </label>
+            <div class="placement">
+              <label for="position-2">Put image 2</label>
+              <select id="position-2">
+                <option value="first">as the first page</option>
+                <option value="last" selected>as the last page</option>
+                <option value="before">before page</option>
+              </select>
+              <input id="page-2" type="number" min="1" inputmode="numeric" aria-label="Page number for image 2" hidden>
+            </div>
+            <button type="button" id="remove-image" class="text-button">Remove image 2</button>
+          </div>
+
+          <p class="note">Page numbers count your PDF's pages as they are now. If both images go in the same place, image 1 comes first.</p>
+        </div>
+
+        <fieldset class="choice">
           <legend>Page quality</legend>
           <label><input type="radio" name="quality" value="standard" checked><span>Standard<small>Smaller file</small></span></label>
           <label><input type="radio" name="quality" value="high"><span>High<small>Sharper small print</small></span></label>
@@ -56,7 +111,7 @@
           </div>
         </div>
 
-        <button id="submit" type="submit" disabled>Protect document</button>
+        <button id="submit" type="submit">Protect document</button>
         <p id="status" class="status" role="status" aria-live="polite"></p>
       </form>
     </section>

@@ -9,6 +9,8 @@ A small FastAPI app that turns a PDF, Word or PowerPoint file into a PDF that ca
 3. The images are assembled into a new PDF at the original page size.
 4. The PDF is encrypted with AES-256. It opens without a password, but copying, printing and editing are turned off and require the owner password.
 
+The **Add images to a PDF** option takes a PDF and one or two PNG or JPEG images. Each image becomes a page at the first page, the last page or before a chosen page, counting the PDF's pages as uploaded. It takes the size of the page beside it, then goes through the same steps.
+
 Step 2 does the real work. PDF permissions are only honoured by well-behaved viewers, and some tools ignore them. Screenshots and text recognition remain possible, which is why a watermark is part of each image.
 
 ## Run locally

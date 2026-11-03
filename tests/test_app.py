@@ -362,6 +362,179 @@ def test_real_conversion_of_word_document(client):
     assert extract_text(response.content).strip() == ""
 
 
+RED, BLUE = (220, 30, 30), (30, 30, 220)
+
+
+def make_image(colour=RED, size=(300, 200), fmt="PNG", mode="RGB", **save) -> bytes:
+    buffer = io.BytesIO()
+    protect.Image.new(mode, size, colour).save(buffer, format=fmt, **save)
+    return buffer.getvalue()
+
+
+def make_sized_pdf(sizes) -> bytes:
+    source = pikepdf.new()
+    for size in sizes:
+        source.add_blank_page(page_size=size)
+    buffer = io.BytesIO()
+    source.save(buffer)
+    return buffer.getvalue()
+
+
+def insert(client, pdf: bytes, *images, **form):
+    """Each image is (data, filename, position, page)."""
+    files = [("file", ("doc.pdf", pdf))]
+    data = dict(form)
+    for number, (image, name, position, page) in enumerate(images, start=1):
+        files.append((f"image{number}", (name, image)))
+        data[f"position{number}"] = position
+        data[f"page{number}"] = page
+    return client.post("/api/insert", files=files, data=data)
+
+
+def page_colours(content: bytes) -> list[tuple]:
+    document = pdfium.PdfDocument(content)
+    colours = []
+    for index in range(len(document)):
+        image = document[index].render(scale=0.25).to_pil().convert("RGB")
+        colours.append(image.getpixel((image.width // 2, image.height // 2)))
+    return colours
+
+
+def is_close(colour, target):
+    return all(abs(a - b) < 30 for a, b in zip(colour, target))
+
+
+def test_images_go_where_chosen_and_take_neighbour_size(client):
+    sizes = [(300, 400), (500, 200), (612, 792)]
+    response = insert(
+        client,
+        make_sized_pdf(sizes),
+        (make_image(RED), "red.png", "before", "3"),
+        (make_image(BLUE, fmt="JPEG"), "blue.jpg", "before", "2"),
+    )
+    assert response.status_code == 200
+    document = pdfium.PdfDocument(response.content)
+    # Page numbers count the original PDF, so each image lands before the page it names.
+    assert [document[i].get_size() for i in range(len(document))] == [sizes[0], sizes[1], sizes[1], sizes[2], sizes[2]]
+    colours = page_colours(response.content)
+    assert is_close(colours[1], BLUE) and is_close(colours[3], RED)
+    assert all(is_close(colours[i], (255, 255, 255)) for i in (0, 2, 4))
+    assert extract_text(response.content).strip() == ""
+    with pikepdf.open(io.BytesIO(response.content)) as pdf:
+        assert pdf.is_encrypted and not pdf.allow.extract and not pdf.allow.print_highres
+
+
+def test_first_last_and_shared_spot_order(client):
+    pdf = make_sized_pdf([(612, 792)] * 2)
+    both_first = insert(client, pdf, (make_image(RED), "a.png", "first", ""), (make_image(BLUE), "b.jpeg", "first", ""))
+    colours = page_colours(both_first.content)
+    assert len(colours) == 4 and is_close(colours[0], RED) and is_close(colours[1], BLUE)
+
+    first_last = insert(client, pdf, (make_image(RED), "a.png", "last", ""), (make_image(BLUE), "b.png", "first", ""))
+    colours = page_colours(first_last.content)
+    assert is_close(colours[0], BLUE) and is_close(colours[3], RED)
+
+
+def test_one_image_is_enough(client):
+    response = insert(client, make_sized_pdf([(612, 792)]), (make_image(RED), "a.png", "last", ""))
+    assert response.status_code == 200
+    assert 'filename="doc-encreept.pdf"' in response.headers["content-disposition"]
+    assert len(pdfium.PdfDocument(response.content)) == 2
+
+
+def test_image_is_fitted_and_centred(client):
+    # A wide image on a portrait page: full width, white above and below.
+    response = insert(client, make_sized_pdf([(400, 800)]), (make_image(RED, size=(800, 200)), "a.png", "first", ""))
+    page = pdfium.PdfDocument(response.content)[0].render(scale=0.5).to_pil().convert("L")
+    left, top, right, bottom = page.point(lambda value: 255 if value < 200 else 0).getbbox()
+    assert left <= 2 and right >= page.width - 2
+    assert abs((top + bottom) / 2 - page.height / 2) < 4
+    assert (bottom - top) == pytest.approx(page.width / 4, abs=4)
+
+
+def test_transparent_image_sits_on_white(client):
+    image = make_image((0, 0, 0, 0), mode="RGBA")
+    response = insert(client, make_sized_pdf([(612, 792)]), (image, "clear.png", "first", ""))
+    assert is_close(page_colours(response.content)[0], (255, 255, 255))
+
+
+def test_phone_photo_rotation_is_respected(client):
+    exif = protect.Image.Exif()
+    exif[0x0112] = 6  # Rotated 90 degrees, as phone cameras record it.
+    photo = make_image(RED, size=(400, 100), fmt="JPEG", exif=exif)
+    response = insert(client, make_sized_pdf([(500, 500)]), (photo, "photo.jpg", "first", ""))
+    page = pdfium.PdfDocument(response.content)[0].render(scale=0.5).to_pil().convert("L")
+    left, top, right, bottom = page.point(lambda value: 255 if value < 200 else 0).getbbox()
+    assert bottom - top > (right - left) * 3
+
+
+def test_watermark_covers_image_pages(client):
+    white = make_image((255, 255, 255))
+    plain = insert(client, make_sized_pdf([(612, 792)]), (white, "w.png", "first", ""))
+    marked = insert(client, make_sized_pdf([(612, 792)]), (white, "w.png", "first", ""), watermark="Draft")
+
+    def darkest(content):
+        return pdfium.PdfDocument(content)[0].render(scale=0.5).to_pil().convert("L").getextrema()[0]
+
+    assert darkest(plain.content) > 245
+    assert darkest(marked.content) < 240
+
+
+@pytest.mark.parametrize(
+    ("image", "name", "position", "page", "message"),
+    [
+        (make_image(), "a.png", "before", "0", "from 1 to 3"),
+        (make_image(), "a.png", "before", "4", "from 1 to 3"),
+        (make_image(), "a.png", "before", "two", "from 1 to 3"),
+        (make_image(), "a.png", "", "", "Choose where image 1 goes"),
+        (make_image(fmt="GIF"), "a.gif", "first", "", "must be a PNG or JPEG"),
+        (b"not an image", "a.png", "first", "", "isn't a valid PNG or JPEG"),
+        (make_image(fmt="GIF"), "a.png", "first", "", "isn't a valid PNG or JPEG"),
+        (b"", "a.png", "first", "", "Image 1 is empty"),
+    ],
+)
+def test_bad_insertions_get_clear_errors(client, image, name, position, page, message):
+    response = insert(client, make_sized_pdf([(612, 792)] * 3), (image, name, position, page))
+    assert response.status_code == 400
+    assert message in response.json()["detail"]
+
+
+def test_insert_needs_a_real_pdf_and_an_image(client):
+    response = insert(client, b"not a pdf", (make_image(), "a.png", "first", ""))
+    assert "valid PDF" in response.json()["detail"]
+    missing = client.post("/api/insert", files={"file": ("doc.pdf", make_pdf(pages=1))})
+    assert missing.status_code == 400
+    assert "missing" in missing.json()["detail"]
+
+
+def test_second_image_error_names_it(client):
+    response = insert(
+        client, make_sized_pdf([(612, 792)]), (make_image(), "a.png", "first", ""), (b"junk", "b.png", "last", "")
+    )
+    assert "Image 2" in response.json()["detail"]
+
+
+def test_oversized_image_is_rejected(client, monkeypatch):
+    monkeypatch.setattr(protect, "MAX_IMAGE_PIXELS", 1000)
+    response = insert(client, make_sized_pdf([(612, 792)]), (make_image(size=(100, 100)), "a.png", "first", ""))
+    assert response.status_code == 400
+    assert "pixels" in response.json()["detail"]
+
+
+def test_page_limit_counts_inserted_images(client, monkeypatch):
+    monkeypatch.setattr(protect, "MAX_PAGES", 2)
+    response = insert(client, make_sized_pdf([(612, 792)] * 2), (make_image(), "a.png", "first", ""))
+    assert response.status_code == 400
+    assert "limit is 2" in response.json()["detail"]
+
+
+def test_insert_leaves_no_working_files(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(main.tempfile, "tempdir", str(tmp_path))
+    assert insert(client, make_sized_pdf([(612, 792)]), (make_image(), "a.png", "first", "")).status_code == 200
+    assert insert(client, make_sized_pdf([(612, 792)]), (make_image(), "a.png", "before", "9")).status_code == 400
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_converter_producing_nothing_is_an_error(client, tmp_path, monkeypatch):
     monkeypatch.setattr(protect, "_soffice_command", lambda: [sys.executable, "-c", "pass"])
     response = upload(client, make_office("word/"), "paper.docx")
