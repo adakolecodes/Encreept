@@ -167,7 +167,15 @@ form.addEventListener("submit", async (event) => {
 
   submit.disabled = true;
   sheet.dataset.state = "working";
-  setStatus("Working on your document. Keep this page open: long files can take several minutes or more.");
+  // The server sends nothing until the PDF is ready, so the elapsed time shows it's still going.
+  const started = Date.now();
+  const showProgress = () => {
+    const seconds = Math.floor((Date.now() - started) / 1000);
+    const elapsed = seconds < 60 ? `${seconds} s` : `${Math.floor(seconds / 60)} min ${seconds % 60} s`;
+    setStatus(`Working on your document (${elapsed} so far). Keep this page open: a long document can take 5 to 10 minutes.`);
+  };
+  showProgress();
+  const ticker = setInterval(showProgress, 1000);
 
   try {
     const response = await fetch(mode.endpoint, { method: "POST", body });
@@ -187,6 +195,7 @@ form.addEventListener("submit", async (event) => {
     sheet.dataset.state = "";
     setStatus("The connection dropped before the document was ready. Check your connection and try again.", true);
   } finally {
+    clearInterval(ticker);
     submit.disabled = false;
   }
 });

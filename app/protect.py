@@ -264,9 +264,8 @@ def clean_watermark(label: str) -> str:
     return cleaned
 
 
-def _apply_watermark(page: Image.Image, label: str) -> Image.Image:
-    """Draw one faint bold line through the page centre, corner to corner, sized to fit."""
-    width, height = page.size
+def _watermark_mask(label: str, width: int, height: int) -> Image.Image:
+    """The label as a faint, rotated mask that runs corner to corner on a page this size."""
     angle = math.atan2(height, width)
     cos, sin = math.cos(angle), math.sin(angle)
 
@@ -283,12 +282,27 @@ def _apply_watermark(page: Image.Image, label: str) -> Image.Image:
     left, top, right, bottom = font.getbbox(label)
     mask = Image.new("L", (right - left, bottom - top), 0)
     ImageDraw.Draw(mask).text((-left, -top), label, font=font, fill=WATERMARK_OPACITY)
-    mask = mask.rotate(math.degrees(angle), expand=True, resample=Image.Resampling.BICUBIC)
+    return mask.rotate(math.degrees(angle), expand=True, resample=Image.Resampling.BICUBIC)
 
-    page = page.convert("RGB")
+
+def _apply_watermark(page: Image.Image, label: str, masks: dict | None = None) -> Image.Image:
+    """Draw one faint bold line through the page centre, sized to fit.
+
+    Pass the same masks dict for every page of a document: drawing the rotated
+    label takes about as long as rendering a page, and most pages share a size.
+    """
+    width, height = page.size
+    if masks is None:
+        masks = {}
+    if page.size not in masks:
+        masks[page.size] = _watermark_mask(label, width, height)
+    mask = masks[page.size]
+
+    if page.mode != "RGB":
+        page = page.convert("RGB")
     box = ((width - mask.width) // 2, (height - mask.height) // 2)
     # Dark text on light pages, light text on dark ones.
-    behind = page.convert("L").crop((*box, box[0] + mask.width, box[1] + mask.height))
+    behind = page.crop((*box, box[0] + mask.width, box[1] + mask.height)).convert("L")
     colour = (40, 40, 40) if ImageStat.Stat(behind).mean[0] > 110 else (255, 255, 255)
     page.paste(colour, box, mask)
     return page
@@ -425,6 +439,7 @@ def _rasterise_to_pdf(
         raise ProtectionError(f"This document has {len(pages)} pages. The limit is {MAX_PAGES}.")
 
     documents: dict[Path, pdfium.PdfDocument] = {}
+    masks: dict[tuple[int, int], Image.Image] = {}
     try:
         with destination.open("wb") as handle:
             writer = _ImagePdfWriter(handle)
@@ -442,7 +457,7 @@ def _rasterise_to_pdf(
                     finally:
                         page.close()
                 if watermark:
-                    image = _apply_watermark(image, watermark)
+                    image = _apply_watermark(image, watermark, masks)
 
                 buffer = io.BytesIO()
                 image.save(buffer, format="JPEG", quality=preset["jpeg_quality"], optimize=True)

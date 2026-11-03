@@ -131,6 +131,15 @@ def test_watermark_is_light_on_dark_pages():
     assert protect._apply_watermark(page, "Draft").convert("L").getextrema()[1] > 30
 
 
+def test_watermark_mask_is_drawn_once_per_page_size():
+    masks = {}
+    first = protect._apply_watermark(protect.Image.new("RGB", (600, 800), "white"), "Draft", masks)
+    second = protect._apply_watermark(protect.Image.new("RGB", (600, 800), "white"), "Draft", masks)
+    protect._apply_watermark(protect.Image.new("RGB", (800, 600), "white"), "Draft", masks)
+    assert list(masks) == [(600, 800), (800, 600)]
+    assert first.tobytes() == second.tobytes()
+
+
 def test_watermark_label_is_tidied():
     assert protect.clean_watermark("  My   Draft  ") == "My Draft"
 
